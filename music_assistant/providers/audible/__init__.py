@@ -594,7 +594,7 @@ class Audibleprovider(MusicProvider):
 
     async def get_resume_position(
         self, prov_item_id: str, media_type: MediaType
-    ) -> tuple[bool, int, float]:
+    ) -> tuple[bool, int, datetime | None]:
         """Return resume position from Audible for the given item.
 
         Called by MA just before queuing an audiobook for playback.
@@ -608,7 +608,7 @@ class Audibleprovider(MusicProvider):
         if media_type != MediaType.AUDIOBOOK:
             raise NotImplementedError
         position_ms = await self.helper.get_last_postion(prov_item_id)
-        return False, position_ms, datetime.now(UTC).timestamp()
+        return False, position_ms, datetime.now(UTC)
 
     async def unload(self, is_removed: bool = False) -> None:
         """
