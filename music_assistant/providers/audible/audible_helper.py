@@ -605,8 +605,12 @@ class AudibleHelper:
         block provider startup. Books not yet in MA's DB (library sync still
         in progress) are skipped silently.
         """
-        # Guard: while this flag is True, on_played() will skip set_last_position()
-        # so mark_item_played() calls below do not fan back out to Audible.
+        # Prevent concurrent runs (cold-start task + first scheduled fire can overlap).
+        if self._syncing_from_audible:
+            self.logger.debug("Audible progress sync already in progress, skipping")
+            return
+        # While True, on_played() skips set_last_position() so mark_item_played()
+        # calls below do not fan back out to Audible.
         self._syncing_from_audible = True
         try:
             asins: list[str] = []
@@ -690,6 +694,7 @@ class AudibleHelper:
                     mass_audiobook,
                     fully_played=False,
                     seconds_played=seconds_played,
+                    user_initiated=False,
                 )
                 self.logger.debug(
                     "Synced Audible position %ds for audiobook %s", seconds_played, asin

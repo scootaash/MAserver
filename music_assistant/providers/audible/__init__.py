@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import os
 from collections.abc import AsyncGenerator, Sequence
-from datetime import UTC, datetime
+from datetime import datetime
 from logging import getLevelName
 from typing import TYPE_CHECKING, cast
 from urllib.parse import quote, unquote
@@ -266,7 +266,7 @@ class Audibleprovider(MusicProvider):
             task_id=f"audible_progress_sync_{self.instance_id}",
             name=f"Sync Audible progress ({self.name})",
             handler=self.helper.sync_progress_from_audible,
-            schedule=TaskSchedule.hourly(every=10),
+            schedule=TaskSchedule.hourly(every=1),
         )
 
     # Cache for authenticators to avoid repeated file I/O
