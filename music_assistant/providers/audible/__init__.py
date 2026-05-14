@@ -590,12 +590,13 @@ class Audibleprovider(MusicProvider):
 
         media_item is the full media item details of the played/playing track.
         """
-        if self.helper._syncing_from_audible:
+        if prov_item_id in self.helper._sync_suppressed_asins:
+            self.helper._sync_suppressed_asins.discard(prov_item_id)
             return
         await self.helper.set_last_position(prov_item_id, position, media_type)
 
     async def get_resume_position(
-        self, item_id: str, media_type: MediaType
+        self, prov_item_id: str, media_type: MediaType
     ) -> tuple[bool, int, datetime | None]:
         """Return resume position from Audible for the given item.
 
@@ -604,13 +605,10 @@ class Audibleprovider(MusicProvider):
         uses whichever source is more recent.  Raises NotImplementedError on
         transport failure so MA falls back to its own playlog rather than
         presenting a stale or missing position as authoritative.
-
-        :param item_id: The provider-side ASIN of the audiobook.
-        :param media_type: Media type; only AUDIOBOOK is supported.
         """
         if media_type != MediaType.AUDIOBOOK:
             raise NotImplementedError
-        return await self.helper.get_audible_resume_position(item_id)
+        return await self.helper.get_audible_resume_position(prov_item_id)
 
     async def unload(self, is_removed: bool = False) -> None:
         """
