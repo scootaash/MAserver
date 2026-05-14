@@ -253,6 +253,10 @@ class Audibleprovider(MusicProvider):
         self._client: audible.AsyncClient | None = None
         audible.log_helper.set_level(getLevelName(self.logger.level))
         await self._login()
+        # Sync positions from Audible in the background; does not block init.
+        # Library sync runs concurrently, so books may not yet be in MA's DB —
+        # missing items are skipped silently and picked up on the next sync.
+        self.mass.create_task(self.helper.sync_progress_from_audible())
 
     # Cache for authenticators to avoid repeated file I/O
     _AUTH_CACHE: dict[str, audible.Authenticator] = {}
