@@ -536,13 +536,13 @@ class AudibleHelper:
         except Exception as exc:
             self.logger.error(f"Unexpected error reporting position for ASIN {asin}: {exc}")
 
-    async def get_audible_resume_position(
-        self, asin: str
-    ) -> tuple[bool, int, datetime | None]:
+    async def get_audible_resume_position(self, asin: str) -> tuple[bool, int, datetime | None]:
         """Return (fully_played, position_ms, last_updated) from Audible for a single ASIN.
 
         Raises NotImplementedError when data is unavailable or on transport failure so
         MA's music controller falls back to its own internal playlog instead.
+
+        :param asin: The Audible ASIN of the audiobook.
         """
         if not asin or asin == "error":
             raise NotImplementedError
@@ -577,18 +577,18 @@ class AudibleHelper:
         # Parse the Audible-supplied timestamp so MA's playlog tiebreaker works
         # correctly. The field is "last_updated" in the Audible annotation payload;
         # additional names are tried as a fallback against future API variation.
+        # Values may be ISO-8601 strings or epoch seconds/milliseconds depending on
+        # the marketplace.
         timestamp: datetime | None = None
         for field in ("last_updated", "reported_time", "last_updated_time", "timestamp"):
             raw_ts = last_position.get(field) or annotation.get(field)
-            if raw_ts:
-                try:
-                    timestamp = datetime.fromisoformat(str(raw_ts).replace("Z", "+00:00"))
-                except (ValueError, TypeError):
-                    self.logger.debug(
-                        "Could not parse Audible timestamp %r for %s", raw_ts, asin
-                    )
-                else:
-                    break
+            if not raw_ts:
+                continue
+            parsed = _parse_audible_timestamp(raw_ts)
+            if parsed is not None:
+                timestamp = parsed
+                break
+            self.logger.debug("Could not parse Audible timestamp %r for %s", raw_ts, asin)
 
         return False, position_ms, timestamp
 
@@ -605,18 +605,18 @@ class AudibleHelper:
         block provider startup. Books not yet in MA's DB (library sync still
         in progress) are skipped silently.
         """
-        # Prevent concurrent runs (cold-start task + first scheduled fire can overlap).
+        # Defuse cold-start vs scheduled-task races: a fresh restart after a
+        # long downtime can schedule the first hourly run with a 0-delay while
+        # handle_async_init's create_task is still mid-sync.
         if self._syncing_from_audible:
-            self.logger.debug("Audible progress sync already in progress, skipping")
+            self.logger.debug("Audible progress sync already running, skipping")
             return
-        # While True, on_played() skips set_last_position() so mark_item_played()
-        # calls below do not fan back out to Audible.
+        # Guard: while this flag is True, on_played() will skip set_last_position()
+        # so mark_item_played() calls below do not fan back out to Audible.
         self._syncing_from_audible = True
         try:
             asins: list[str] = []
-            async for item in self._fetch_library_items(
-                "product_attrs", AUDIOBOOK_CONTENT_TYPES
-            ):
+            async for item in self._fetch_library_items("product_attrs", AUDIOBOOK_CONTENT_TYPES):
                 asin = str(item.get("asin", ""))
                 if asin and asin != "error":
                     asins.append(asin)
@@ -625,9 +625,7 @@ class AudibleHelper:
                 self.logger.debug("No audiobooks found, skipping Audible progress sync")
                 return
 
-            self.logger.debug(
-                "Syncing Audible positions for %d audiobook(s)", len(asins)
-            )
+            self.logger.debug("Syncing Audible positions for %d audiobook(s)", len(asins))
 
             # Audible caps the comma-joined asins value at 500 chars; chunk by
             # serialised length rather than count to stay safely under the limit.
@@ -636,8 +634,7 @@ class AudibleHelper:
             for asin in asins:
                 extra = len(asin) + (1 if batch else 0)  # +1 for joining comma
                 if batch and (
-                    batch_len + extra > _MAX_ASINS_PARAM_LEN
-                    or len(batch) >= _MAX_ASINS_PER_REQUEST
+                    batch_len + extra > _MAX_ASINS_PARAM_LEN or len(batch) >= _MAX_ASINS_PER_REQUEST
                 ):
                     await self._sync_progress_chunk(batch)
                     batch, batch_len = [asin], len(asin)
@@ -700,7 +697,7 @@ class AudibleHelper:
                     "Synced Audible position %ds for audiobook %s", seconds_played, asin
                 )
 
-        except Exception as exc:
+        except (KeyError, TypeError, TimeoutError, ConnectionError) as exc:
             self.logger.warning("Error syncing Audible progress chunk: %s", exc)
 
     async def _call_api(self, path: str, **kwargs: Any) -> Any:
@@ -1288,6 +1285,43 @@ def _html_to_txt(html_text: str) -> str:
     for tag in tags:
         txt = txt.replace(tag, "")
     return txt
+
+
+def _parse_audible_timestamp(raw_ts: Any) -> datetime | None:
+    """Parse an Audible last-updated timestamp.
+
+    Audible has returned both ISO-8601 strings and epoch numbers (seconds or
+    milliseconds) for last-updated fields across marketplaces and API versions.
+    Returns a timezone-aware UTC datetime, or None if the value is unparseable.
+
+    :param raw_ts: The raw value from the annotation payload.
+    """
+    # Epoch number (seconds or ms).
+    if isinstance(raw_ts, (int, float)) and not isinstance(raw_ts, bool):
+        epoch = float(raw_ts)
+        if epoch > 1e12:  # likely milliseconds
+            epoch /= 1000.0
+        try:
+            return datetime.fromtimestamp(epoch, UTC)
+        except (OverflowError, OSError, ValueError):
+            return None
+    # ISO-8601 string (Python's fromisoformat handles trailing Z natively on 3.11+).
+    if isinstance(raw_ts, str):
+        try:
+            return datetime.fromisoformat(raw_ts)
+        except ValueError:
+            # Numeric string fallback.
+            try:
+                epoch = float(raw_ts)
+            except ValueError:
+                return None
+            if epoch > 1e12:
+                epoch /= 1000.0
+            try:
+                return datetime.fromtimestamp(epoch, UTC)
+            except (OverflowError, OSError, ValueError):
+                return None
+    return None
 
 
 async def audible_get_auth_info(locale: str) -> tuple[str, str, str]:
