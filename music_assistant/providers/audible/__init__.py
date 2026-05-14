@@ -590,6 +590,8 @@ class Audibleprovider(MusicProvider):
 
         media_item is the full media item details of the played/playing track.
         """
+        if self.helper._syncing_from_audible:
+            return
         await self.helper.set_last_position(prov_item_id, position, media_type)
 
     async def get_resume_position(
@@ -598,17 +600,14 @@ class Audibleprovider(MusicProvider):
         """Return resume position from Audible for the given item.
 
         Called by MA just before queuing an audiobook for playback.
-        Returns (fully_played, position_ms, timestamp) so MA can compare
-        against its internal playlog and use whichever source is more recent.
-        We return datetime.now() as the timestamp so that the live Audible
-        position wins over a stale internal playlog entry; the two will be
-        equal when the previous session was entirely within MA (because
-        on_played() pushes each position update back to Audible).
+        MA compares the returned timestamp against its internal playlog and
+        uses whichever source is more recent.  Raises NotImplementedError on
+        transport failure so MA falls back to its own playlog rather than
+        presenting a stale or missing position as authoritative.
         """
         if media_type != MediaType.AUDIOBOOK:
             raise NotImplementedError
-        position_ms = await self.helper.get_last_postion(prov_item_id)
-        return False, position_ms, datetime.now(UTC)
+        return await self.helper.get_audible_resume_position(prov_item_id)
 
     async def unload(self, is_removed: bool = False) -> None:
         """
@@ -617,10 +616,6 @@ class Audibleprovider(MusicProvider):
         Called when provider is deregistered (e.g. MA exiting or config reloading).
         is_removed will be set to True when the provider is removed from the configuration.
         """
-        task_id = f"audible_progress_sync_{self.instance_id}"
-        try:
-            self.mass.tasks.unregister_scheduled_task(task_id)
-        except Exception:  # noqa: BLE001
-            pass
+        self.mass.tasks.unregister_scheduled_task(f"audible_progress_sync_{self.instance_id}")
         if is_removed:
             await self.helper.deregister()
