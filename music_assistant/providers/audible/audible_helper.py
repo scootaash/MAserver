@@ -50,6 +50,10 @@ CACHE_CATEGORY_PODCAST_EPISODES = 4
 AUDIOBOOK_CONTENT_TYPES = ("SinglePartBook", "MultiPartBook")
 PODCAST_CONTENT_TYPES = ("PodcastParent",)
 
+# Audible caps the comma-joined asins query-param value at 500 chars.
+# Use 480 to stay safely under the limit regardless of ASIN length.
+_MAX_ASINS_PARAM_LEN = 480
+
 _AUTH_CACHE: dict[str, audible.Authenticator] = {}
 
 
@@ -559,10 +563,20 @@ class AudibleHelper:
                 "Syncing Audible positions for %d audiobook(s)", len(asins)
             )
 
-            # Audible accepts comma-separated ASINs; stay within safe URL length
-            chunk_size = 50
-            for i in range(0, len(asins), chunk_size):
-                await self._sync_progress_chunk(asins[i : i + chunk_size])
+            # Audible caps the comma-joined asins value at 500 chars; chunk by
+            # serialised length rather than count to stay safely under the limit.
+            batch: list[str] = []
+            batch_len = 0
+            for asin in asins:
+                extra = len(asin) + (1 if batch else 0)  # +1 for joining comma
+                if batch and batch_len + extra > _MAX_ASINS_PARAM_LEN:
+                    await self._sync_progress_chunk(batch)
+                    batch, batch_len = [asin], len(asin)
+                else:
+                    batch.append(asin)
+                    batch_len += extra
+            if batch:
+                await self._sync_progress_chunk(batch)
 
         except Exception as exc:
             self.logger.error("Error during Audible progress sync: %s", exc)
@@ -611,7 +625,7 @@ class AudibleHelper:
                 )
 
         except Exception as exc:
-            self.logger.error("Error syncing Audible progress chunk: %s", exc)
+            self.logger.warning("Error syncing Audible progress chunk: %s", exc)
 
     async def _call_api(self, path: str, **kwargs: Any) -> Any:
         response = None
@@ -1135,7 +1149,7 @@ class AudibleHelper:
             "contributors,media,product_attrs,product_desc,series", AUDIOBOOK_CONTENT_TYPES
         ):
             for narrator in item.get("narrators") or []:
-                if narrator.get("asin") == narrator_asin:
+                if narrator.get(\"asin\") == narrator_asin:
                     release_date = item.get("release_date") or "0000-00-00"
                     audiobooks.append((release_date, self._parse_audiobook(item)))
                     break
