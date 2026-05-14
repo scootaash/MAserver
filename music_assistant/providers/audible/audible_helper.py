@@ -529,6 +529,90 @@ class AudibleHelper:
         except Exception as exc:
             self.logger.error(f"Unexpected error reporting position for ASIN {asin}: {exc}")
 
+    async def sync_progress_from_audible(self) -> None:
+        """Sync listening positions from Audible into MA's internal progress database.
+
+        Reads last-heard positions for all library audiobooks from Audible's
+        annotations endpoint and pushes them into MA's internal store via
+        mark_item_played. This lets MA resume at the correct position even
+        when the previous session happened in the Audible phone app or another
+        Whispersync-connected device.
+
+        Called as a background task from handle_async_init so it does not
+        block provider startup. Books not yet in MA's DB (library sync still
+        in progress) are skipped silently.
+        """
+        try:
+            asins: list[str] = []
+            async for item in self._fetch_library_items(
+                "product_attrs", AUDIOBOOK_CONTENT_TYPES
+            ):
+                asin = str(item.get("asin", ""))
+                if asin and asin != "error":
+                    asins.append(asin)
+
+            if not asins:
+                self.logger.debug("No audiobooks found, skipping Audible progress sync")
+                return
+
+            self.logger.debug(
+                "Syncing Audible positions for %d audiobook(s)", len(asins)
+            )
+
+            # Audible accepts comma-separated ASINs; stay within safe URL length
+            chunk_size = 50
+            for i in range(0, len(asins), chunk_size):
+                await self._sync_progress_chunk(asins[i : i + chunk_size])
+
+        except Exception as exc:
+            self.logger.error("Error during Audible progress sync: %s", exc)
+
+    async def _sync_progress_chunk(self, asins: list[str]) -> None:
+        """Push Audible last-heard positions for one chunk of ASINs into MA."""
+        try:
+            response = await self._call_api(
+                "annotations/lastpositions",
+                asins=",".join(asins),
+            )
+            if not response:
+                return
+
+            annotations = response.get("asin_last_position_heard_annots", [])
+            for annotation in annotations:
+                if not isinstance(annotation, dict):
+                    continue
+                asin = annotation.get("asin")
+                last_position = annotation.get("last_position_heard")
+                if not asin or not isinstance(last_position, dict):
+                    continue
+
+                position_ms = last_position.get("position_ms", 0)
+                if not position_ms:
+                    continue
+
+                seconds_played = int(position_ms) // 1000
+
+                mass_audiobook = await self.mass.music.get_library_item_by_prov_id(
+                    media_type=MediaType.AUDIOBOOK,
+                    item_id=asin,
+                    provider_instance_id_or_domain=self.provider_instance,
+                )
+                if mass_audiobook is None:
+                    # Book not yet in MA DB (library sync still running); skip
+                    continue
+
+                await self.mass.music.mark_item_played(
+                    mass_audiobook,
+                    fully_played=False,
+                    seconds_played=seconds_played,
+                )
+                self.logger.debug(
+                    "Synced Audible position %ds for audiobook %s", seconds_played, asin
+                )
+
+        except Exception as exc:
+            self.logger.error("Error syncing Audible progress chunk: %s", exc)
+
     async def _call_api(self, path: str, **kwargs: Any) -> Any:
         response = None
         use_cache = kwargs.pop("use_cache", False)
