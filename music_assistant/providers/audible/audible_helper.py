@@ -575,6 +575,9 @@ class AudibleHelper:
             raise NotImplementedError
 
         position_ms = int(last_position.get("position_ms", 0))
+        if position_ms == 0:
+            # No meaningful position on Audible's side — let MA use its own playlog.
+            raise NotImplementedError
 
         # Parse the Audible-supplied timestamp so MA's playlog tiebreaker works
         # correctly. The field is "last_updated" in the Audible annotation payload;
@@ -614,7 +617,8 @@ class AudibleHelper:
         self._syncing_from_audible = True
         # Resolve the MA user that owns this provider instance so mark_item_played
         # writes only to the correct user's playlog instead of fanning out to all users.
-        userid: str | None = self.mass.music._get_user_for_provider(self.provider_instance)
+        user = await self.mass.music._get_user_for_provider(self.provider_instance)
+        userid: str | None = user.user_id if user is not None else None
         try:
             asins: list[str] = []
             async for item in self._fetch_library_items(
@@ -654,7 +658,9 @@ class AudibleHelper:
             self.logger.error("Error during Audible progress sync: %s", exc)
         finally:
             self._syncing_from_audible = False
-            self._sync_suppressed_asins.clear()
+            # Do not bulk-clear _sync_suppressed_asins here: mark_item_played schedules
+            # on_played via create_task, so those tasks may not have run yet. Each entry
+            # is discarded individually by on_played() when it fires.
 
     async def _sync_progress_chunk(self, asins: list[str], userid: str | None) -> None:
         """Push Audible last-heard positions for one chunk of ASINs into MA."""
