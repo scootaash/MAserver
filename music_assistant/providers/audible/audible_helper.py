@@ -37,6 +37,7 @@ from music_assistant_models.media_items import (
 )
 from music_assistant_models.streamdetails import StreamDetails
 
+from music_assistant.constants import DB_TABLE_PLAYLOG
 from music_assistant.mass import MusicAssistant
 
 CACHE_DOMAIN = "audible"
@@ -49,6 +50,12 @@ CACHE_CATEGORY_PODCAST_EPISODES = 4
 # Content delivery types
 AUDIOBOOK_CONTENT_TYPES = ("SinglePartBook", "MultiPartBook")
 PODCAST_CONTENT_TYPES = ("PodcastParent",)
+
+# Audible caps the comma-joined asins query-param value at 500 chars.
+# Use 480 to stay safely under the limit regardless of ASIN length.
+_MAX_ASINS_PARAM_LEN = 480
+# Audible also rejects requests with more than 25 ASINs at once.
+_MAX_ASINS_PER_REQUEST = 25
 
 _AUTH_CACHE: dict[str, audible.Authenticator] = {}
 
@@ -146,6 +153,8 @@ class AudibleHelper:
         self.provider_instance = provider_instance
         self.logger = logger or logging.getLogger("audible_helper")
         self._acr_cache: dict[tuple[str, MediaType], str] = {}
+        self._syncing_from_audible: bool = False
+        self._sync_suppressed_asins: set[str] = set()
 
     async def _fetch_library_items(
         self,
@@ -529,6 +538,62 @@ class AudibleHelper:
         except Exception as exc:
             self.logger.error(f"Unexpected error reporting position for ASIN {asin}: {exc}")
 
+    async def get_audible_resume_position(
+        self, asin: str
+    ) -> tuple[bool, int, datetime | None]:
+        """Return (fully_played, position_ms, last_updated) from Audible for a single ASIN.
+
+        Raises NotImplementedError when data is unavailable or on transport failure so
+        MA's music controller falls back to its own internal playlog instead.
+        """
+        if not asin or asin == "error":
+            raise NotImplementedError
+
+        try:
+            response = await self._call_api("annotations/lastpositions", asins=asin)
+        except Exception as exc:
+            self.logger.debug(
+                "Audible lastpositions fetch failed for %s, falling back to MA playlog: %s",
+                asin,
+                exc,
+            )
+            raise NotImplementedError from exc
+
+        if not response:
+            raise NotImplementedError
+
+        annotations = response.get("asin_last_position_heard_annots")
+        if not annotations or not isinstance(annotations, list):
+            raise NotImplementedError
+
+        annotation = annotations[0] if annotations else None
+        if not isinstance(annotation, dict):
+            raise NotImplementedError
+
+        last_position = annotation.get("last_position_heard")
+        if not isinstance(last_position, dict):
+            raise NotImplementedError
+
+        position_ms = int(last_position.get("position_ms", 0))
+
+        # Parse the Audible-supplied timestamp so MA's playlog tiebreaker works
+        # correctly. The field is "last_updated" in the Audible annotation payload;
+        # additional names are tried as a fallback against future API variation.
+        timestamp: datetime | None = None
+        for field in ("last_updated", "reported_time", "last_updated_time", "timestamp"):
+            raw_ts = last_position.get(field) or annotation.get(field)
+            if raw_ts:
+                try:
+                    timestamp = datetime.fromisoformat(str(raw_ts).replace("Z", "+00:00"))
+                except (ValueError, TypeError):
+                    self.logger.debug(
+                        "Could not parse Audible timestamp %r for %s", raw_ts, asin
+                    )
+                else:
+                    break
+
+        return False, position_ms, timestamp
+
     async def sync_progress_from_audible(self) -> None:
         """Sync listening positions from Audible into MA's internal progress database.
 
@@ -542,6 +607,14 @@ class AudibleHelper:
         block provider startup. Books not yet in MA's DB (library sync still
         in progress) are skipped silently.
         """
+        # Prevent concurrent runs (cold-start task + first scheduled fire can overlap).
+        if self._syncing_from_audible:
+            self.logger.debug("Audible progress sync already in progress, skipping")
+            return
+        self._syncing_from_audible = True
+        # Resolve the MA user that owns this provider instance so mark_item_played
+        # writes only to the correct user's playlog instead of fanning out to all users.
+        userid: str | None = self.mass.music._get_user_for_provider(self.provider_instance)
         try:
             asins: list[str] = []
             async for item in self._fetch_library_items(
@@ -559,15 +632,31 @@ class AudibleHelper:
                 "Syncing Audible positions for %d audiobook(s)", len(asins)
             )
 
-            # Audible accepts comma-separated ASINs; stay within safe URL length
-            chunk_size = 50
-            for i in range(0, len(asins), chunk_size):
-                await self._sync_progress_chunk(asins[i : i + chunk_size])
+            # Audible caps the comma-joined asins value at 500 chars; chunk by
+            # serialised length rather than count to stay safely under the limit.
+            batch: list[str] = []
+            batch_len = 0
+            for asin in asins:
+                extra = len(asin) + (1 if batch else 0)  # +1 for joining comma
+                if batch and (
+                    batch_len + extra > _MAX_ASINS_PARAM_LEN
+                    or len(batch) >= _MAX_ASINS_PER_REQUEST
+                ):
+                    await self._sync_progress_chunk(batch, userid)
+                    batch, batch_len = [asin], len(asin)
+                else:
+                    batch.append(asin)
+                    batch_len += extra
+            if batch:
+                await self._sync_progress_chunk(batch, userid)
 
         except Exception as exc:
             self.logger.error("Error during Audible progress sync: %s", exc)
+        finally:
+            self._syncing_from_audible = False
+            self._sync_suppressed_asins.clear()
 
-    async def _sync_progress_chunk(self, asins: list[str]) -> None:
+    async def _sync_progress_chunk(self, asins: list[str], userid: str | None) -> None:
         """Push Audible last-heard positions for one chunk of ASINs into MA."""
         try:
             response = await self._call_api(
@@ -590,7 +679,20 @@ class AudibleHelper:
                 if not position_ms:
                     continue
 
-                seconds_played = int(position_ms) // 1000
+                # Parse Audible's last_updated so we can skip writing if MA already
+                # has an equal or newer position (prevents stale overwrites).
+                audible_ts: datetime | None = None
+                for field in ("last_updated", "reported_time", "last_updated_time", "timestamp"):
+                    raw_ts = last_position.get(field) or annotation.get(field)
+                    if raw_ts:
+                        try:
+                            audible_ts = datetime.fromisoformat(
+                                str(raw_ts).replace("Z", "+00:00")
+                            )
+                        except (ValueError, TypeError):
+                            pass
+                        else:
+                            break
 
                 mass_audiobook = await self.mass.music.get_library_item_by_prov_id(
                     media_type=MediaType.AUDIOBOOK,
@@ -601,17 +703,39 @@ class AudibleHelper:
                     # Book not yet in MA DB (library sync still running); skip
                     continue
 
+                # Skip if MA's existing record is as recent as Audible's position.
+                if audible_ts is not None:
+                    existing = await self.mass.music.database.get_row(
+                        DB_TABLE_PLAYLOG,
+                        {
+                            "item_id": mass_audiobook.item_id,
+                            "provider": self.provider_instance,
+                            "media_type": MediaType.AUDIOBOOK.value,
+                            **({"userid": userid} if userid is not None else {}),
+                        },
+                    )
+                    if existing:
+                        ma_ts = existing.get("timestamp")
+                        if ma_ts is not None and int(ma_ts) >= int(audible_ts.timestamp()):
+                            continue
+
+                seconds_played = int(position_ms) // 1000
+                # Add the ASIN to the suppression set before mark_item_played so that
+                # the on_played fan-out it triggers does not loop back to set_last_position.
+                self._sync_suppressed_asins.add(asin)
                 await self.mass.music.mark_item_played(
                     mass_audiobook,
                     fully_played=False,
                     seconds_played=seconds_played,
+                    userid=userid,
+                    user_initiated=False,
                 )
                 self.logger.debug(
                     "Synced Audible position %ds for audiobook %s", seconds_played, asin
                 )
 
         except Exception as exc:
-            self.logger.error("Error syncing Audible progress chunk: %s", exc)
+            self.logger.warning("Error syncing Audible progress chunk: %s", exc)
 
     async def _call_api(self, path: str, **kwargs: Any) -> Any:
         response = None

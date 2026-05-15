@@ -5,12 +5,14 @@ from __future__ import annotations
 import asyncio
 import os
 from collections.abc import AsyncGenerator, Sequence
+from datetime import datetime
 from logging import getLevelName
 from typing import TYPE_CHECKING, cast
 from urllib.parse import quote, unquote
 from uuid import uuid4
 
 import audible
+from music_assistant_models.background_task import TaskSchedule
 from music_assistant_models.config_entries import (
     ConfigEntry,
     ConfigValueOption,
@@ -253,10 +255,19 @@ class Audibleprovider(MusicProvider):
         self._client: audible.AsyncClient | None = None
         audible.log_helper.set_level(getLevelName(self.logger.level))
         await self._login()
-        # Sync positions from Audible in the background; does not block init.
-        # Library sync runs concurrently, so books may not yet be in MA's DB —
-        # missing items are skipped silently and picked up on the next sync.
+        # Cold-start sync: fire immediately in the background so books
+        # that were read on another device show the correct resume position.
+        # Library sync runs concurrently; missing books are skipped silently
+        # and picked up on the next periodic run.
         self.mass.create_task(self.helper.sync_progress_from_audible())
+        # Periodic sync: keep MA's resume positions in sync even when the
+        # user has been listening on the Audible phone app between MA sessions.
+        self.mass.tasks.register_scheduled_task(
+            task_id=f"audible_progress_sync_{self.instance_id}",
+            name=f"Sync Audible progress ({self.name})",
+            handler=self.helper.sync_progress_from_audible,
+            schedule=TaskSchedule.hourly(every=1),
+        )
 
     # Cache for authenticators to avoid repeated file I/O
     _AUTH_CACHE: dict[str, audible.Authenticator] = {}
@@ -579,7 +590,25 @@ class Audibleprovider(MusicProvider):
 
         media_item is the full media item details of the played/playing track.
         """
+        if prov_item_id in self.helper._sync_suppressed_asins:
+            self.helper._sync_suppressed_asins.discard(prov_item_id)
+            return
         await self.helper.set_last_position(prov_item_id, position, media_type)
+
+    async def get_resume_position(
+        self, prov_item_id: str, media_type: MediaType
+    ) -> tuple[bool, int, datetime | None]:
+        """Return resume position from Audible for the given item.
+
+        Called by MA just before queuing an audiobook for playback.
+        MA compares the returned timestamp against its internal playlog and
+        uses whichever source is more recent.  Raises NotImplementedError on
+        transport failure so MA falls back to its own playlog rather than
+        presenting a stale or missing position as authoritative.
+        """
+        if media_type != MediaType.AUDIOBOOK:
+            raise NotImplementedError
+        return await self.helper.get_audible_resume_position(prov_item_id)
 
     async def unload(self, is_removed: bool = False) -> None:
         """
@@ -588,5 +617,6 @@ class Audibleprovider(MusicProvider):
         Called when provider is deregistered (e.g. MA exiting or config reloading).
         is_removed will be set to True when the provider is removed from the configuration.
         """
+        self.mass.tasks.unregister_scheduled_task(f"audible_progress_sync_{self.instance_id}")
         if is_removed:
             await self.helper.deregister()
