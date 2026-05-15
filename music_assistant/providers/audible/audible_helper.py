@@ -621,12 +621,12 @@ class AudibleHelper:
         if self._syncing_from_audible:
             self.logger.debug("Audible progress sync already in progress, skipping")
             return
-        self._syncing_from_audible = True
-        # Resolve the MA user that owns this provider instance so mark_item_played
-        # writes only to the correct user's playlog instead of fanning out to all users.
-        user = await self.mass.music._get_user_for_provider(self.provider_instance)
-        userid: str | None = user.user_id if user is not None else None
         try:
+            self._syncing_from_audible = True
+            # Pass userid=None so mark_item_played uses its own user-resolution
+            # fallback (via provider_mappings on the media item). This avoids
+            # calling a private API and is equivalent for all supported setups.
+            userid: str | None = None
             asins: list[str] = []
             async for item in self._fetch_library_items(
                 "product_attrs", AUDIOBOOK_CONTENT_TYPES
