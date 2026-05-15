@@ -588,6 +588,10 @@ class AudibleHelper:
             if raw_ts:
                 try:
                     timestamp = datetime.fromisoformat(str(raw_ts).replace("Z", "+00:00"))
+                    # Treat naive datetimes as UTC so comparisons are correct on
+                    # non-UTC servers (Audible uses "Z" today, but guard anyway).
+                    if timestamp.tzinfo is None:
+                        timestamp = timestamp.replace(tzinfo=UTC)
                 except (ValueError, TypeError):
                     self.logger.debug(
                         "Could not parse Audible timestamp %r for %s", raw_ts, asin
@@ -595,6 +599,9 @@ class AudibleHelper:
                 else:
                     break
 
+        # fully_played is always False here: the lastpositions endpoint does not
+        # carry finished-state; books marked finished on Audible are handled
+        # separately by Whispersync and are not exposed in this payload.
         return False, position_ms, timestamp
 
     async def sync_progress_from_audible(self) -> None:
@@ -695,6 +702,10 @@ class AudibleHelper:
                             audible_ts = datetime.fromisoformat(
                                 str(raw_ts).replace("Z", "+00:00")
                             )
+                            # Treat naive datetimes as UTC so .timestamp() is
+                            # correct on non-UTC servers.
+                            if audible_ts.tzinfo is None:
+                                audible_ts = audible_ts.replace(tzinfo=UTC)
                         except (ValueError, TypeError):
                             pass
                         else:
@@ -710,12 +721,14 @@ class AudibleHelper:
                     continue
 
                 # Skip if MA's existing record is as recent as Audible's position.
+                # mark_item_played writes with media_item.provider which resolves to
+                # "library" for library items — use mass_audiobook.provider to match.
                 if audible_ts is not None:
                     existing = await self.mass.music.database.get_row(
                         DB_TABLE_PLAYLOG,
                         {
                             "item_id": mass_audiobook.item_id,
-                            "provider": self.provider_instance,
+                            "provider": mass_audiobook.provider,
                             "media_type": MediaType.AUDIOBOOK.value,
                             **({"userid": userid} if userid is not None else {}),
                         },
@@ -726,8 +739,11 @@ class AudibleHelper:
                             continue
 
                 seconds_played = int(position_ms) // 1000
-                # Add the ASIN to the suppression set before mark_item_played so that
-                # the on_played fan-out it triggers does not loop back to set_last_position.
+                # Add the ASIN to the suppression set before mark_item_played so the
+                # on_played fan-out does not loop back to set_last_position. A user
+                # starting playback of this exact ASIN in the narrow window between
+                # here and the on_played task running would lose one 30-second write
+                # back to Audible — acceptable given the periodic sync cadence.
                 self._sync_suppressed_asins.add(asin)
                 await self.mass.music.mark_item_played(
                     mass_audiobook,
