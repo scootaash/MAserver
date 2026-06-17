@@ -507,6 +507,16 @@ class AudibleHelper:
             if timestamp is not None:
                 break
 
+        self.logger.warning(
+            "AUDIBLE-DEBUG _fetch_last_position asin=%s position_ms=%s timestamp=%s "
+            "raw_last_position=%s annotation_keys=%s",
+            asin,
+            position_ms,
+            timestamp,
+            last_position,
+            list(annotation.keys()),
+        )
+
         return position_ms, timestamp
 
     async def get_last_position(self, asin: str) -> int:

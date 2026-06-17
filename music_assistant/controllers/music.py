@@ -1715,6 +1715,18 @@ class MusicController(CoreController):
             ma_fully_played = parse_optional_bool(db_entry["fully_played"]) or False
             ma_timestamp = from_utc_timestamp(db_entry["timestamp"])
 
+        self.logger.warning(
+            "AUDIBLE-DEBUG get_resume_position item=%s prov_pos_ms=%s prov_ts=%s "
+            "prov_fully=%s ma_pos_ms=%s ma_ts=%s ma_fully=%s",
+            media_item.uri,
+            provider_position_ms,
+            provider_timestamp,
+            provider_fully_played,
+            ma_position_ms,
+            ma_timestamp,
+            ma_fully_played,
+        )
+
         if provider_timestamp is not None and provider_timestamp > ma_timestamp:
             return provider_fully_played, provider_position_ms
         # Return the higher position to ensure users never lose progress
