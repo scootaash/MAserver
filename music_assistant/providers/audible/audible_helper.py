@@ -456,7 +456,8 @@ class AudibleHelper:
 
     @staticmethod
     def _parse_audible_timestamp(raw_ts: Any) -> datetime | None:
-        """Parse an Audible timestamp value into a timezone-aware datetime.
+        """
+        Parse an Audible timestamp value into a timezone-aware datetime.
 
         :param raw_ts: The raw timestamp value from the Audible annotation payload.
         """
@@ -471,7 +472,8 @@ class AudibleHelper:
         return parsed
 
     async def _fetch_last_position(self, asin: str) -> tuple[int, datetime | None] | None:
-        """Fetch the last-heard position for a single ASIN from Audible.
+        """
+        Fetch the last-heard position for a single ASIN from Audible.
 
         :param asin: The audiobook ASIN to query.
         """
@@ -504,7 +506,8 @@ class AudibleHelper:
         return position_ms, timestamp
 
     async def get_last_postion(self, asin: str) -> int:
-        """Fetch the last-heard position in milliseconds for the given ASIN.
+        """
+        Fetch the last-heard position in milliseconds for the given ASIN.
 
         :param asin: The audiobook ASIN to query.
         """
@@ -560,7 +563,8 @@ class AudibleHelper:
             self.logger.error(f"Unexpected error reporting position for ASIN {asin}: {exc}")
 
     async def get_audible_resume_position(self, asin: str) -> tuple[bool, int, datetime | None]:
-        """Return resume state for the given ASIN from Audible.
+        """
+        Return resume state for the given ASIN from Audible.
 
         :param asin: The audiobook ASIN to query.
         """
